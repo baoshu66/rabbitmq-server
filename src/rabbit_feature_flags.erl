@@ -93,7 +93,8 @@
          is_node_compatible/1,
          is_node_compatible/2,
          sync_feature_flags_with_cluster/1,
-         sync_feature_flags_with_cluster/2
+         sync_feature_flags_with_cluster/2,
+         enabled_feature_flags_list_file/0
         ]).
 
 %% Internal use only.
@@ -187,8 +188,8 @@
 -type migration_fun_context() :: enable.
 
 -export_type([feature_flag_modattr/0,
-              feature_name/0,
               feature_props/0,
+              feature_name/0,
               feature_flags/0,
               feature_props_extended/0,
               stability/0,
@@ -471,7 +472,7 @@ get_state(FeatureName) when is_atom(FeatureName) ->
                  end
     end.
 
--spec get_stability(feature_name() | feature_props()) -> stability().
+-spec get_stability(feature_name() | feature_props_extended()) -> stability().
 
 get_stability(FeatureName) when is_atom(FeatureName) ->
     case rabbit_ff_registry:get(FeatureName) of
@@ -486,11 +487,17 @@ get_stability(FeatureProps) when is_map(FeatureProps) ->
 %% -------------------------------------------------------------------
 
 init() ->
+    ensure_enabled_feature_flags_list_file_exists(),
     _ = list(all),
     ok.
 
 initialize_registry() ->
-    EnabledFeatureNames = read_enabled_feature_flags_list(),
+    RegistryInitialized = rabbit_ff_registry:is_registry_initialized(),
+    EnabledFeatureNames = case RegistryInitialized of
+                              true  -> maps:keys(
+                                         rabbit_ff_registry:list(enabled));
+                              false -> read_enabled_feature_flags_list()
+                          end,
     initialize_registry(EnabledFeatureNames, []).
 
 initialize_registry(EnabledFeatureNames, ChangingFeatureNames) ->
@@ -553,9 +560,11 @@ regen_registry_mod(AllFeatureFlags,
                       [erl_syntax:arity_qualifier(
                          erl_syntax:atom(F),
                          erl_syntax:integer(A))
-                       || {F, A} <- [{list, 1},
+                       || {F, A} <- [{get, 1},
+                                     {list, 1},
                                      {is_supported, 1},
-                                     {is_enabled, 1}]]
+                                     {is_enabled, 1},
+                                     {is_registry_initialized, 0}]]
                      )
                    ]
                   ),
@@ -632,13 +641,24 @@ regen_registry_mod(AllFeatureFlags,
                      erl_syntax:atom(is_enabled),
                      IsEnabledClauses ++ [NotEnabledClause]),
     IsEnabledFunForm = erl_syntax:revert(IsEnabledFun),
+    %% is_registry_initialized() -> ...
+    IsInitializedClauses = [erl_syntax:clause(
+                              [],
+                              [],
+                              [erl_syntax:atom(true)])
+                           ],
+    IsInitializedFun = erl_syntax:function(
+                         erl_syntax:atom(is_registry_initialized),
+                         IsInitializedClauses),
+    IsInitializedFunForm = erl_syntax:revert(IsInitializedFun),
     %% Compilation!
     Forms = [ModuleForm,
              ExportForm,
              GetFunForm,
              ListFunForm,
              IsSupportedFunForm,
-             IsEnabledFunForm],
+             IsEnabledFunForm,
+             IsInitializedFunForm],
     CompileOpts = [return_errors,
                    return_warnings],
     case compile:forms(Forms, CompileOpts) of
@@ -674,6 +694,20 @@ load_registry_mod(Mod, Bin) ->
 %% Feature flags state storage.
 %% -------------------------------------------------------------------
 
+ensure_enabled_feature_flags_list_file_exists() ->
+    File = enabled_feature_flags_list_file(),
+    case filelib:is_regular(File) of
+        true ->
+            ok;
+        false ->
+            case write_enabled_feature_flags_list([]) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    throw({feature_flags_file_write_error, File, Reason})
+            end
+    end.
+
 read_enabled_feature_flags_list() ->
     File = enabled_feature_flags_list_file(),
     case file:consult(File) of
@@ -685,7 +719,17 @@ read_enabled_feature_flags_list() ->
 write_enabled_feature_flags_list(FeatureNames) ->
     File = enabled_feature_flags_list_file(),
     Content = io_lib:format("~p.~n", [FeatureNames]),
-    file:write_file(File, Content).
+    Ret = file:write_file(File, Content),
+    case Ret of
+        ok ->
+            ok;
+        {error, Reason} ->
+            rabbit_log:error(
+              "Feature flags: failed to write the `feature_flags` "
+              "file at `~s`: ~s",
+              [File, file:format_error(Reason)])
+    end,
+    Ret.
 
 enabled_feature_flags_list_file() ->
     case application:get_env(rabbit, feature_flags_file) of
@@ -802,6 +846,7 @@ mark_as_enabled_locally(FeatureName) ->
                     [FeatureName]),
     EnabledFeatureNames = lists:usort(
                             [FeatureName | maps:keys(list(enabled))]),
+    %% FIXME: Handle the error of a failed write!
     write_enabled_feature_flags_list(EnabledFeatureNames),
     initialize_registry(EnabledFeatureNames, []).
 
